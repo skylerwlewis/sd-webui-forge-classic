@@ -215,7 +215,14 @@ class VAE:
 
             for x in range(0, samples_in.shape[0], batch_number):
                 samples = samples_in[x : x + batch_number].to(device=self.device, dtype=self.vae_dtype)
+                # Clamp latent to safe range before decode to prevent NaN in VAE GroupNorm on MPS
+                if self.device.type == "mps":
+                    samples = samples.clamp(-30.0, 30.0)
                 out = self.process_output(self.first_stage_model.decode(samples).to(device=self.output_device, dtype=torch.float32, copy=True))
+                # Sanitize any NaN/inf that MPS VAE GroupNorm may produce
+                if torch.isnan(out).any() or torch.isinf(out).any():
+                    memory_management.logger.warning("NaN/inf in VAE output on MPS; applying nan_to_num")
+                    out = out.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
                 if pixel_samples is None:
                     pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
                 pixel_samples[x : x + batch_number] = out

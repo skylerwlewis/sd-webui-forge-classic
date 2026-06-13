@@ -15,6 +15,14 @@ logger = logging.getLogger("attention")
 setup_logger(logger)
 
 
+MPS_SDPA_AVAILABLE = False
+if memory_management.cpu_state is memory_management.CPUState.MPS:
+    try:
+        from mps_sdpa import sdpa_opt as _mps_sdpa_opt
+        MPS_SDPA_AVAILABLE = True
+    except Exception:
+        pass
+
 if memory_management.xformers_enabled() or memory_management.xformers_enabled_vae():
     import xformers
     import xformers.ops
@@ -216,6 +224,34 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
 
+    # On MPS, use Apple's native fused SDPA op via mps-sdpa only for very long
+    # sequences (WAN video ~20k tokens) where PyTorch SDPA would hit MPS buffer
+    # limits. For normal SDXL/SD attention (<= 8192 tokens), PyTorch SDPA is
+    # numerically safer.
+    MPS_SDPA_SEQ_THRESHOLD = 8192
+    if q.device.type == "mps":
+        seq_len = q.shape[2]
+        if MPS_SDPA_AVAILABLE and seq_len > MPS_SDPA_SEQ_THRESHOLD:
+            out = _mps_sdpa_opt(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        else:
+            # Use head-chunking for long sequences when mps-sdpa is unavailable,
+            # or PyTorch SDPA directly for short sequences.
+            if seq_len > MPS_SDPA_SEQ_THRESHOLD:
+                out = torch.empty_like(q)
+                for h in range(q.shape[1]):
+                    m = mask
+                    if mask is not None and mask.shape[1] > 1:
+                        m = mask[:, h : h + 1]
+                    out[:, h : h + 1] = operations.scaled_dot_product_attention(
+                        q[:, h : h + 1], k[:, h : h + 1], v[:, h : h + 1],
+                        attn_mask=m, dropout_p=0.0, is_causal=False,
+                    )
+            else:
+                out = operations.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        if not skip_output_reshape:
+            out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out
+
     if SDP_BATCH_LIMIT >= b:
         out = operations.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         if not skip_output_reshape:
@@ -352,7 +388,10 @@ elif memory_management.xformers_enabled():
     logger.info("Using xformers Cross Attention")
     attention_function = attention_xformers
 elif memory_management.pytorch_attention_enabled():
-    logger.info("Using PyTorch Cross Attention")
+    if MPS_SDPA_AVAILABLE:
+        logger.info("Using PyTorch Cross Attention (MPS native fused SDPA via mps-sdpa)")
+    else:
+        logger.info("Using PyTorch Cross Attention")
     attention_function = attention_pytorch
 else:
     logger.info("Using Basic Cross Attention")

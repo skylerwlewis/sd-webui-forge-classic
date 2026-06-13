@@ -96,11 +96,16 @@ def _torch_version() -> tuple[str, str]:
     m = re.search(r"(\d+\.\d+\.\d+)(?:[^+]+)?\+(.+)", ver)
 
     if m is None:
-        print("\n\nFailed to parse PyTorch version...")
-        ver = os.environ.get("PYTORCH_VERSION", "2.10.0+cu130")
-        print("Assuming: ", ver)
-        print('(you can change this with `export PYTORCH_VERSION="..."`)\n\n')
-        m = re.search(r"(\d+\.\d+\.\d+)(?:[^+]+)?\+(.+)", ver)
+        env_ver = os.environ.get("PYTORCH_VERSION", None)
+        if env_ver:
+            m = re.search(r"(\d+\.\d+\.\d+)(?:[^+]+)?\+(.+)", env_ver)
+
+    if m is None:
+        # Plain version with no build suffix (e.g. MPS/CPU builds)
+        m2 = re.search(r"(\d+\.\d+\.\d+)", ver)
+        if m2:
+            return m2.group(1), "cpu"
+        return "0.0.0", "cpu"
 
     return m.group(1), m.group(2)
 

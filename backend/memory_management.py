@@ -284,6 +284,8 @@ if is_nvidia() and torch_version_numeric[0] >= 2:
     ENABLE_PYTORCH_ATTENTION = True
 elif is_intel_xpu():
     ENABLE_PYTORCH_ATTENTION = True
+elif cpu_state is CPUState.MPS:
+    ENABLE_PYTORCH_ATTENTION = True
 
 
 SUPPORT_FP8_OPS: bool = None
@@ -843,7 +845,12 @@ def inference_cast(weight_dtype: torch.dtype, inference_device: torch.device, su
         return weight_dtype
 
     fp16_supported = should_use_fp16(inference_device, prioritize_performance=False)
+    # On MPS, fp16 computation can produce NaN/inf in SDXL-style models due to limited
+    # dynamic range. Upcast to bf16 for computation if the device is MPS and bf16 is supported.
     if fp16_supported and weight_dtype == torch.float16:
+        bf16_supported = should_use_bf16(inference_device)
+        if bf16_supported and (inference_device is not None and getattr(inference_device, "type", None) == "mps"):
+            return torch.bfloat16
         return weight_dtype
 
     bf16_supported = should_use_bf16(inference_device)

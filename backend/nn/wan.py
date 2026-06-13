@@ -390,7 +390,14 @@ class WanModel(nn.Module):
         bs, c, t, h, w = x.shape
 
         if c < self.in_dim:
-            assert args.dynamic_args.concat_latent is not None
+            if args.dynamic_args.concat_latent is None:
+                # I2V model used without a start image — synthesise a zero concat latent
+                # so generation continues rather than crashing. The result will be
+                # T2V-style (no image conditioning). Use ImageStitch to provide a start frame.
+                extra_c = self.in_dim - c
+                args.dynamic_args.concat_latent = torch.zeros(
+                    (1, extra_c, t, h, w), dtype=x.dtype, device="cpu"
+                )
             r = args.dynamic_args.concat_latent.to(x)
             if x.shape[0] == 2:  # batch_cond_uncond
                 r = torch.cat((r, r), dim=0)

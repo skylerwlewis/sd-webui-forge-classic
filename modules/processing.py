@@ -610,6 +610,11 @@ class DecodedSamples(list):
 
 def decode_latent_batch(model, batch, target_device=None, check_for_nans=False):
     samples = DecodedSamples()
+
+    if check_for_nans and torch.isnan(batch).any():
+        memory_management.logger.warning("NaN detected in latent before VAE decode; clamping to zero")
+        batch = batch.nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)
+
     samples_pytorch = decode_first_stage(model, batch).to(target_device)
 
     for x in samples_pytorch:
@@ -983,6 +988,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
             samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
+
+            # Clear WAN I2V concat latent after sampling so stale state doesn't affect next generation
+            args.dynamic_args.concat_latent = None
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)
