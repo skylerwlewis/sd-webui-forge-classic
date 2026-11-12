@@ -1,12 +1,13 @@
 import logging
 import os.path
+from typing import Callable, OrderedDict
 
 import gradio as gr
 import torch
 from gradio.context import Context
+from gradio.events import Dependency
 from rich import print_json
 
-from backend import memory_management
 from backend.args import dynamic_args
 from backend.logging import setup_logger
 from modules import (
@@ -27,6 +28,7 @@ ui_forge_preset: gr.Radio
 ui_checkpoint: gr.Dropdown
 ui_vae: gr.Dropdown
 ui_forge_unet_dtype: gr.Radio
+_event_refresh: Dependency
 
 forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "Automatic": (None, False),
@@ -37,22 +39,13 @@ forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "float8-e5m2 (fp16 LoRA)": (torch.float8_e5m2, True),
 }
 
-if memory_management.bnb_enabled():
-    forge_unet_storage_dtype_options.update(
-        {
-            "bnb-nf4": ("nf4", False),
-            "bnb-nf4 (fp16 LoRA)": ("nf4", True),
-            "bnb-fp4": ("fp4", False),
-            "bnb-fp4 (fp16 LoRA)": ("fp4", True),
-        }
-    )
 
-
-module_list: dict[str, os.PathLike] = {}
+module_list: OrderedDict[str, os.PathLike] = OrderedDict()
+module_map: OrderedDict[str, str] = OrderedDict()
 
 
 def make_checkpoint_manager_ui():
-    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype
+    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, _event_refresh
 
     if shared.opts.sd_model_checkpoint in [None, "None", "none", ""]:
         if len(sd_models.checkpoints_list) == 0:
@@ -60,7 +53,11 @@ def make_checkpoint_manager_ui():
         if len(sd_models.checkpoints_list) > 0:
             shared.opts.set("sd_model_checkpoint", next(iter(sd_models.checkpoints_list.values())).name)
 
-    ui_forge_preset = gr.Dropdown(label="UI Preset", value=lambda: shared.opts.forge_preset, choices=PresetArch.choices(), elem_id="forge_ui_preset")
+    def preset_choices():
+        presets = [p for p in PresetArch.choices() if p not in shared.cmd_opts.disable_preset]
+        return sorted(presets) if shared.cmd_opts.sort_preset else presets
+
+    ui_forge_preset = gr.Dropdown(label="UI Preset", value=shared.opts.forge_preset, choices=preset_choices(), elem_id="forge_ui_preset")
 
     ui_checkpoint = gr.Dropdown(label="Checkpoint", value=None, choices=None, elem_id="setting_sd_model_checkpoint", elem_classes=["model_selection"])
 
@@ -71,10 +68,10 @@ def make_checkpoint_manager_ui():
         return [gr.update(choices=ckpt_list), gr.update(choices=vae_list)]
 
     refresh_button = ui_common.ToolButton(value=ui_common.refresh_symbol, elem_id="forge_refresh_checkpoint", tooltip="Refresh")
-    refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
+    _event_refresh = refresh_button.click(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
     Context.root_block.load(fn=refresh_model_list, outputs=[ui_checkpoint, ui_vae], queue=False)
 
-    ui_forge_unet_dtype = gr.Dropdown(label="Diffusion in Low Bits", value=lambda: shared.opts.forge_unet_storage_dtype, choices=list(forge_unet_storage_dtype_options.keys()), elem_id="forge_ui_dtype")
+    ui_forge_unet_dtype = gr.Dropdown(label="Diffusion in Low Bits", value=None, choices=list(forge_unet_storage_dtype_options.keys()), elem_id="forge_ui_dtype")
 
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
@@ -93,11 +90,13 @@ def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) ->
 
 def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
     shared_items.refresh_checkpoints()
+    shared_items.refresh_vae_list()
     ckpt_list = shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
 
     file_extensions = ("ckpt", "pt", "pth", "bin", "safetensors", "sft", "gguf")
 
-    module_list.clear()
+    _module_list: dict[str, os.PathLike] = {}
+    _module_map: dict[str, str] = {}
 
     module_paths: set[os.PathLike] = {
         os.path.abspath(os.path.join(paths.models_path, "VAE")),
@@ -108,12 +107,25 @@ def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
 
     for vae_path in module_paths:
         vae_files = find_files_with_extensions(vae_path, file_extensions)
-        module_list.update(vae_files)
+        _module_list.update(vae_files)
 
-    return sorted(ckpt_list), sorted(module_list.keys())
+        for file, path in vae_files.items():
+            rel = os.path.normpath(os.path.relpath(path, vae_path))
+            _module_map[file] = rel
+
+    module_list.clear()
+    module_map.clear()
+
+    module_list.update({title: _module_list[title] for title in sorted(_module_list)})
+    module_map.update({title: _module_map[title] for title in sorted(_module_map)})
+
+    if shared.opts.sd_modules_dropdown_use_short:
+        return ckpt_list, list(module_list.keys())
+    else:
+        return ckpt_list, list(module_map.values())
 
 
-def refresh_model_loading_parameters(*, refresh: bool = True):
+def refresh_model_loading_parameters(*, refresh: bool = True, disable_log: bool = False):
     if not refresh:
         return
 
@@ -132,15 +144,21 @@ def refresh_model_loading_parameters(*, refresh: bool = True):
     modules: list[str] = [os.path.basename(x) for x in shared.opts.forge_additional_modules]
     dtype = str(unet_storage_dtype or [torch.float16, torch.bfloat16])
 
-    logger.info("Model Selected:")
-    print_json(data=dict(checkpoint=os.path.basename(ckpt), modules=modules, dtype=dtype))
+    if not disable_log:
+        logger.info("Model Selected:")
+        print_json(data=dict(checkpoint=os.path.basename(ckpt), modules=modules, dtype=dtype))
 
     if ckpt.endswith(("gguf", "GGUF")) and not lora_fp16:
-        logger.warning("GGUF requires fp16 LoRA ; overriding option")
         lora_fp16 = True
+        if not disable_log:
+            logger.warning("GGUF requires fp16 LoRA ; overriding option")
 
     dynamic_args.online_lora = lora_fp16
-    logger.info(f"Patch LoRAs on-the-fly: {lora_fp16}")
+
+    if not disable_log:
+        logger.info(f"Patch LoRAs on-the-fly: {lora_fp16}")
+        if not ckpt.endswith(("gguf", "GGUF")) and lora_fp16:
+            logger.warning("on-the-fly WILL be slower ; enable only if you know what you are doing")
 
     processing.need_global_unload = True
 
@@ -263,6 +281,7 @@ def forge_main_entry():
     Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
     refresh_model_loading_parameters()
+    _refreshed_callback()
 
 
 def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: str, ui_forge_preset: str):
@@ -291,10 +310,14 @@ def on_preset_change(preset: str):
     batch_args_i2i = batch_args_t2i.copy()
     batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
 
+    modules_value = [os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])]
+    if not shared.opts.sd_modules_dropdown_use_short:
+        modules_value = [module_map[m] for m in modules_value]
+
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
         gr.update(value=getattr(shared.opts, f"forge_checkpoint_{preset}", shared.opts.sd_model_checkpoint)),
-        gr.update(value=[os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])]),
+        gr.update(value=modules_value),
         gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic")),
         # ui_txt2img_steps, ui_txt2img_hr_steps, ui_img2img_steps
         gr.update(value=v) if (v := getattr(shared.opts, f"{preset}_t2i_step", 20)) > 0 else gr.skip(),
@@ -322,3 +345,35 @@ def on_preset_change(preset: str):
         gr.update(**batch_args_t2i),
         gr.update(**batch_args_i2i),
     ]
+
+
+# region Callback
+
+
+_CALLBACK_SET = False
+
+_refresh_callbacks: list[tuple[Callable, list[gr.components.Component], list[gr.components.Component]]] = []
+
+
+def capture_callbacks():
+    global _CALLBACK_SET
+    _CALLBACK_SET = False
+    _refresh_callbacks.clear()
+
+
+def on_refresh_checkpoint(callback: Callable, inputs: list[gr.components.Component] = None, outputs: list[gr.components.Component] = None):
+    """register a function to be called after the refresh button for Checkpoint / VAE / Text Encoder is clicked"""
+    if _CALLBACK_SET:
+        raise RuntimeError("Cannot register callback after forge_main_entry")
+    _refresh_callbacks.append((callback, inputs, outputs))
+
+
+def _refreshed_callback():
+    global _CALLBACK_SET
+
+    event = _event_refresh
+
+    for callback, inputs, outputs in _refresh_callbacks:
+        event = event.then(fn=callback, inputs=inputs, outputs=outputs, queue=False, show_progress=False)
+
+    _CALLBACK_SET = True

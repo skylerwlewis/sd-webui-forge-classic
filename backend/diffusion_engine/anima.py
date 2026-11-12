@@ -1,13 +1,19 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from modules.prompt_parser import SdConditioning
+
 import torch
 from huggingface_guess import model_list
 
 from backend import memory_management
+from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
-from backend.modules.k_prediction import PredictionDiscreteFlow
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
-from backend.text_processing.anima_engine import AnimaTextProcessingEngine
+from backend.text_processing.anima_engine import Qwen06Engine
+from modules.shared import opts
 
 
 class Anima(ForgeDiffusionEngine):
@@ -20,11 +26,11 @@ class Anima(ForgeDiffusionEngine):
 
         vae = VAE(model=huggingface_components["vae"], is_wan=True)
 
-        k_predictor = PredictionDiscreteFlow(estimated_config)
+        k_predictor = self._get_predictor()
 
         unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
-        self.text_processing_engine_anima = AnimaTextProcessingEngine(
+        self.text_processing_engine_qwen = Qwen06Engine(
             text_encoder=clip.cond_stage_model.qwen3_06b,
             qwen_tokenizer=clip.tokenizer.qwen3_06b,
             t5_tokenizer=clip.tokenizer.t5xxl,
@@ -38,37 +44,26 @@ class Anima(ForgeDiffusionEngine):
         self.use_shift = True
 
     @torch.inference_mode()
-    def get_learned_conditioning(self, prompt: list[str]):
+    def get_learned_conditioning(self, prompt: "SdConditioning"):
         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
-        return self.text_processing_engine_anima(prompt)
+
+        if not prompt.is_negative_prompt:
+            if not opts.anima_do_reference:
+                dynamic_args.ref_latents.clear()
+            else:
+                _references = [*self.ref_latents]
+                if self.ini_latent is not None:
+                    _references.insert(0, self.ini_latent)
+                    self.ini_latent = None
+                dynamic_args.ref_latents = _references.copy()
+
+        return self.text_processing_engine_qwen(prompt)
 
     @torch.inference_mode()
-    def get_prompt_lengths_on_ui(self, prompt):
-        token_count = len(self.text_processing_engine_anima.tokenize([prompt])[0][0])
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
+        token_count = len(self.text_processing_engine_qwen.tokenize(prompt)[0])
         return token_count, max(512, token_count)
 
     @torch.inference_mode()
     def encode_first_stage(self, x: torch.Tensor):
-        samples: list[torch.Tensor] = []
-        batch: int = x.size(0)
-
-        for b in range(batch):
-            y = x[b].unsqueeze(0)
-            sample = self.forge_objects.vae.encode(y.movedim(1, -1) * 0.5 + 0.5)
-            sample = self.forge_objects.vae.first_stage_model.process_in(sample)
-            samples.append(sample)
-
-        return torch.cat(samples).to(x)
-
-    @torch.inference_mode()
-    def decode_first_stage(self, x: torch.Tensor):
-        samples: list[torch.Tensor] = []
-        batch: int = x.size(0)
-
-        for b in range(batch):
-            y = x[b].unsqueeze(0)
-            sample = self.forge_objects.vae.first_stage_model.process_out(y)
-            sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
-            samples.append(sample)
-
-        return torch.cat(samples).to(x)
+        return super().encode_first_stage(x, multiple=16 if opts.anima_do_reference else 0)

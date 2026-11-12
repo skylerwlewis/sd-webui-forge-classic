@@ -121,15 +121,29 @@ def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap=8, upscale_amou
 
 
 class VAE:
-    def __init__(self, model=None, device=None, dtype=None, no_init=False, *, is_wan=False, is_flux2=False, is_mugen=False):
+    def __init__(self, model=None, device=None, dtype=None, no_init=False, *, is_wan=False, is_qwen21=False, is_flux2=False, is_mugen=False):
         if no_init:
             return
 
-        if not is_wan:
+        self.output_channels = 3
+        self.upscale_index_formula = None
+        self.downscale_index_formula = None
+
+        if is_qwen21:
+            self.upscale_ratio = 16
+            self.downscale_ratio = 16
+            self.latent_dim = 2
+            self.latent_channels = 64
+            self.output_channels = 4
+            self.pad_channel_value = 1.0
+            self.memory_used_encode = lambda shape, dtype: (350 * shape[2] * shape[3]) * memory_management.dtype_size(dtype)
+            self.memory_used_decode = lambda shape, dtype: (700 * shape[2] * shape[3] * (16 * 16)) * memory_management.dtype_size(dtype)
+
+            dtype = dtype or memory_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float16, torch.float32])
+
+        elif not is_wan:
             self.upscale_ratio = 8
-            self.upscale_index_formula = None
             self.downscale_ratio = 8
-            self.downscale_index_formula = None
             self.latent_dim = 2
             self.latent_channels = 32 if is_mugen else int(model.config.latent_channels)  # 4 | 16
             self.memory_used_encode = lambda shape, dtype: (1767 * shape[2] * shape[3]) * memory_management.dtype_size(dtype)
@@ -148,10 +162,15 @@ class VAE:
             self.downscale_index_formula = (4, 8, 8)
             self.latent_dim = 3
             self.latent_channels = int(model.config.z_dim)  # 16
-            self.memory_used_encode = lambda shape, dtype: (1500 if shape[2] <= 4 else 6000) * shape[3] * shape[4] * memory_management.dtype_size(dtype)
-            self.memory_used_decode = lambda shape, dtype: (2200 if shape[2] <= 4 else 7000) * shape[3] * shape[4] * (8 * 8) * memory_management.dtype_size(dtype)
+            if hasattr(model.decoder, "head"):
+                self.output_channels = int(model.decoder.head[-1].out_channels)  # 3 | 4
 
-        self.output_channels = 3
+            striped = hasattr(model, "conv1") and hasattr(model, "conv2")
+            self.memory_used_encode = lambda shape, dtype: (400 if striped and shape[2] == 1 else 1500 if shape[2] <= 4 else 6000) * shape[3] * shape[4] * memory_management.dtype_size(dtype)
+            self.memory_used_decode = lambda shape, dtype: (600 if striped and shape[2] == 1 else 2200 if shape[2] <= 4 else 7000) * shape[3] * shape[4] * (8 * 8) * memory_management.dtype_size(dtype)
+
+            dtype = dtype or memory_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float16, torch.float32])
+
         self.first_stage_model = model.eval()
 
         self.device = device or memory_management.vae_device()
@@ -167,6 +186,7 @@ class VAE:
     def clone(self):
         n = VAE(no_init=True)
         n.patcher = self.patcher.clone()
+        n.output_channels = self.output_channels
         n.memory_used_encode = self.memory_used_encode
         n.memory_used_decode = self.memory_used_decode
         n.downscale_ratio = self.downscale_ratio
@@ -180,7 +200,7 @@ class VAE:
 
     def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
+        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device)) / 3.0)
         return output
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):

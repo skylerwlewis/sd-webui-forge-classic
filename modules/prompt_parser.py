@@ -290,51 +290,33 @@ class DictWithShape(dict):
 
 
 def reconstruct_cond_batch(c: list[list[ScheduledPromptConditioning]], current_step):
-    param = c[0][0].cond
-    is_dict = isinstance(param, dict)
-
-    if is_dict:
-        dict_cond = param
-        res = {k: torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype) for k, param in dict_cond.items()}
-        res = DictWithShape(res)
-    else:
-        res = torch.zeros((len(c),) + param.shape, device=param.device, dtype=param.dtype)
-
-    for i, cond_schedule in enumerate(c):
+    tensors = []
+    for cond_schedule in c:
         target_index = 0
         for current, entry in enumerate(cond_schedule):
             if current_step <= entry.end_at_step:
                 target_index = current
                 break
-
-        if is_dict:
-            for k, param in cond_schedule[target_index].cond.items():
-                res[k][i] = param
-        else:
-            res[i] = cond_schedule[target_index].cond
-
-    return res
+        tensors.append(cond_schedule[target_index].cond)
+    return stack_conditioning(tensors)
 
 
-def stack_conds(tensors):
-    try:
-        result = torch.stack(tensors)
-    except:
-        # if prompts have wildly different lengths above the limit we'll get tensors of different shapes
-        # and won't be able to torch.stack them. So this fixes that.
-        token_count = max([x.shape[0] for x in tensors])
-        for i in range(len(tensors)):
-            if tensors[i].shape[0] != token_count:
-                last_vector = tensors[i][-1:]
-                last_vector_repeated = last_vector.repeat([token_count - tensors[i].shape[0], 1])
-                tensors[i] = torch.vstack([tensors[i], last_vector_repeated])
-        result = torch.stack(tensors)
-    return result
+def stack_conds(tensors: list[torch.Tensor]) -> torch.Tensor:
+    if any(x.shape != tensors[0].shape for x in tensors):
+        raise NotImplementedError("Stacking conditioning with varying shapes is not supported...\nPlease use batch count instead of batch size...")
+    return torch.stack(tensors)
 
 
-def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
-    param = c.batch[0][0].schedules[0].cond
+def stack_conditioning(tensors):
+    shapes = [tuple((k, v.shape) for k, v in x.items()) if isinstance(x, dict) else x.shape for x in tensors]
+    if any(shape != shapes[0] for shape in shapes):
+        return tensors
+    if isinstance(tensors[0], dict):
+        return DictWithShape({k: stack_conds([x[k] for x in tensors]) for k in tensors[0]})
+    return stack_conds(tensors)
 
+
+def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step: int):
     tensors = []
     conds_list = []
 
@@ -353,120 +335,4 @@ def reconstruct_multicond_batch(c: MulticondLearnedConditioning, current_step):
 
         conds_list.append(conds_for_batch)
 
-    if isinstance(tensors[0], dict):
-        keys = list(tensors[0].keys())
-        stacked = {k: stack_conds([x[k] for x in tensors]) for k in keys}
-        stacked = DictWithShape(stacked)
-    else:
-        stacked = stack_conds(tensors).to(device=param.device, dtype=param.dtype)
-
-    return conds_list, stacked
-
-
-re_attention = re.compile(
-    r"""
-\\\(|
-\\\)|
-\\\[|
-\\]|
-\\\\|
-\\|
-\(|
-\[|
-:\s*([+-]?[.\d]+)\s*\)|
-\)|
-]|
-[^\\()\[\]:]+|
-:
-""",
-    re.X,
-)
-
-re_break = re.compile(r"\s*\bBREAK\b\s*", re.S)
-
-
-def parse_prompt_attention(text):
-    r"""
-    Parses a string with attention tokens and returns a list of pairs: text and its associated weight.
-    Accepted tokens are:
-      (abc) - increases attention to abc by a multiplier of 1.1
-      (abc:3.12) - increases attention to abc by a multiplier of 3.12
-      [abc] - decreases attention to abc by a multiplier of 1.1
-      \( - literal character '('
-      \[ - literal character '['
-      \) - literal character ')'
-      \] - literal character ']'
-      \\ - literal character '\'
-      anything else - just text
-
-    >>> parse_prompt_attention('normal text')
-    [['normal text', 1.0]]
-    >>> parse_prompt_attention('an (important) word')
-    [['an ', 1.0], ['important', 1.1], [' word', 1.0]]
-    >>> parse_prompt_attention('(unbalanced')
-    [['unbalanced', 1.1]]
-    >>> parse_prompt_attention(r'\(literal\]')
-    [['(literal]', 1.0]]
-    >>> parse_prompt_attention('(unnecessary)(parens)')
-    [['unnecessaryparens', 1.1]]
-    >>> parse_prompt_attention('a (house:1.3) on a (hill:0.5), sun, (sky).')
-    [['a ', 1.0], ['house', 1.3], [' on a ', 1.0], ['hill', 0.5], [', sun, ', 1.0], ['sky', 1.1], ['.', 1.0]]
-    """
-
-    res = []
-    round_brackets = []
-    square_brackets = []
-
-    round_bracket_multiplier = 1.1
-    square_bracket_multiplier = 1.0 / 1.1
-
-    def multiply_range(start_position, multiplier):
-        for p in range(start_position, len(res)):
-            res[p][1] *= multiplier
-
-    for m in re_attention.finditer(text):
-        text = m.group(0)
-        weight = m.group(1)
-
-        if text.startswith("\\"):
-            res.append([text[1:], 1.0])
-        elif text == "(":
-            round_brackets.append(len(res))
-        elif text == "[":
-            square_brackets.append(len(res))
-        elif weight is not None and round_brackets:
-            multiply_range(round_brackets.pop(), float(weight))
-        elif text == ")" and round_brackets:
-            multiply_range(round_brackets.pop(), round_bracket_multiplier)
-        elif text == "]" and square_brackets:
-            multiply_range(square_brackets.pop(), square_bracket_multiplier)
-        else:
-            parts = re.split(re_break, text)
-            for i, part in enumerate(parts):
-                if i > 0:
-                    res.append(["BREAK", -1])
-                res.append([part, 1.0])
-
-    for pos in round_brackets:
-        multiply_range(pos, round_bracket_multiplier)
-
-    for pos in square_brackets:
-        multiply_range(pos, square_bracket_multiplier)
-
-    if len(res) == 0:
-        res = [["", 1.0]]
-
-    # merge runs of identical weights
-    i = 0
-    while i + 1 < len(res):
-        if res[i][1] == res[i + 1][1]:
-            res[i][0] += res[i + 1][0]
-            res.pop(i + 1)
-        else:
-            i += 1
-
-    return res
-
-
-def strip_emphasis(prompt: str) -> str:
-    return "".join(text for text, _ in parse_prompt_attention(prompt))
+    return conds_list, stack_conditioning(tensors)

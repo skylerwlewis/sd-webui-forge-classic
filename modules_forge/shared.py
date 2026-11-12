@@ -7,6 +7,22 @@ if TYPE_CHECKING:
 
 from backend import utils
 from modules.paths_internal import models_path, normalized_filepath, parser
+from modules_forge.presets import PresetArch
+
+parser.add_argument(
+    "--disable-preset",
+    nargs="+",
+    default=[],
+    type=str,
+    choices=PresetArch.choices(),
+    help="Presets to be disabled",
+)
+
+parser.add_argument(
+    "--sort-preset",
+    action="store_true",
+    help="Sort the Preset dropdown alphabetically",
+)
 
 parser.add_argument(
     "--controlnet-dir",
@@ -48,7 +64,7 @@ def add_supported_preprocessor(preprocessor: "Preprocessor"):
 
 
 def add_supported_control_model(control_model: "ControlModelPatcher"):
-    supported_control_models.append(control_model)
+    supported_control_models.insert(0, control_model)
 
 
 def try_load_supported_control_model(ckpt_path: os.PathLike):

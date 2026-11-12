@@ -1,4 +1,3 @@
-import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -10,11 +9,11 @@ from huggingface_guess import model_list
 from backend import memory_management
 from backend.args import dynamic_args
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
-from backend.modules.k_prediction import PredictionDiscreteFlow
+from backend.misc.image_resize import resize_reference
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
-from backend.text_processing.qwen_engine import QwenTextProcessingEngine
+from backend.text_processing.qwen_image_engine import Qwen25VL7BEngine
 from modules.shared import opts
 
 
@@ -28,11 +27,11 @@ class QwenImage(ForgeDiffusionEngine):
 
         vae = VAE(model=huggingface_components["vae"], is_wan=True)
 
-        k_predictor = PredictionDiscreteFlow(estimated_config)
+        k_predictor = self._get_predictor()
 
         unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
-        self.text_processing_engine_qwen = QwenTextProcessingEngine(
+        self.text_processing_engine_qwen = Qwen25VL7BEngine(
             text_encoder=clip.cond_stage_model.qwen25_7b,
             tokenizer=clip.tokenizer.qwen25_7b,
         )
@@ -53,7 +52,7 @@ class QwenImage(ForgeDiffusionEngine):
                 _references.insert(0, self.ini_latent)
                 self.ini_latent = None
 
-            if _references:
+            if dynamic_args.edit and bool(_references):
                 return self.get_learned_conditioning_with_image(prompt, _references)
             else:
                 dynamic_args.ref_latents.clear()
@@ -73,31 +72,17 @@ class QwenImage(ForgeDiffusionEngine):
         return self.text_processing_engine_qwen(["\n".join([*image_prompts, *prompt])], images=images_vl)
 
     @torch.inference_mode()
-    def get_prompt_lengths_on_ui(self, prompt):
-        token_count = len(self.text_processing_engine_qwen.tokenize([prompt])[0])
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
+        token_count = len(self.text_processing_engine_qwen.tokenize(prompt))
         return token_count, max(999, token_count)
 
     @torch.inference_mode()
-    def encode_vision(self, image: torch.Tensor, i: int) -> tuple[torch.Tensor, str, torch.Tensor]:
-        samples = image.movedim(-1, 1)  # b, c, h, w
+    def encode_vision(self, image: torch.Tensor, i: int) -> tuple[torch.Tensor, torch.Tensor, str]:
+        samples = image.movedim(-1, 1)
 
-        total = int(384 * 384)
-        scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
-        width = round(samples.shape[3] * scale_by)
-        height = round(samples.shape[2] * scale_by)
+        _vision = resize_reference(samples, 1, 384).movedim(1, -1)[:, :, :, :3]
 
-        s = torch.nn.functional.interpolate(samples, size=(height, width), mode="area")
-        _vision = s.movedim(1, -1)
-
-        if opts.qwen_vae_resize:
-            total = int(1024 * 1024)
-            scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
-            width = round(samples.shape[3] * scale_by / 32.0) * 32
-            height = round(samples.shape[2] * scale_by / 32.0) * 32
-
-            s = torch.nn.functional.interpolate(samples, size=(height, width), mode="area")
-        else:
-            s = samples.clone()
+        s = resize_reference(samples, resolution=1024)
         sample = self.forge_objects.vae.encode(s.movedim(1, -1)[:, :, :, :3])
         _latent = self.forge_objects.vae.first_stage_model.process_in(sample)
 
@@ -107,23 +92,8 @@ class QwenImage(ForgeDiffusionEngine):
 
     @torch.inference_mode()
     def encode_first_stage(self, x: torch.Tensor):
-        if x.size(0) > 1:
-            x = x[0].unsqueeze(0)  # enforce batch_size of 1
-
-        start_image = x.movedim(1, -1) * 0.5 + 0.5
-        sample = self.forge_objects.vae.encode(start_image)
-        sample = self.forge_objects.vae.first_stage_model.process_in(sample)
-
         if dynamic_args.edit:
-            if dynamic_args.is_referencing:
-                self.ref_latents.append(start_image.cpu())
-            else:
-                self.ini_latent = start_image.cpu()
+            self.store_reference(x[:1].movedim(1, -1).mul(0.5).add(0.5).cpu())
 
-        return sample.to(x)
-
-    @torch.inference_mode()
-    def decode_first_stage(self, x):
-        sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, 2) * 2.0 - 1.0
-        return sample.to(x)
+        if not dynamic_args.is_referencing:
+            return super().encode_first_stage(x)

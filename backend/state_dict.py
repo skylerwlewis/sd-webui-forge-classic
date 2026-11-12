@@ -3,14 +3,33 @@ import json
 import torch
 
 
-def load_state_dict(model, sd, ignore_errors=[], log_name=None, ignore_start=None):
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+def load_state_dict(model: torch.nn.Module, sd: dict[str, torch.Tensor], ignore_errors: list[str] = [], log_name: str = None, ignore_start: str | list[str] = None):
+    is_meta = any(p.is_meta for p in model.parameters())
+
+    if is_meta:
+        for name, param in [*model.named_parameters(), *model.named_buffers()]:
+            if (entry := sd.get(name, None)) is not None and entry.dtype != param.dtype:
+                sd[name] = entry.to(param.dtype)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=is_meta)
+
+    if is_meta:
+        for module in model.modules():
+            for name, param in module._parameters.items():
+                if param is not None and param.is_meta:
+                    module._parameters[name] = torch.nn.Parameter(torch.zeros(param.shape, dtype=param.dtype), requires_grad=False)
+            for name, buffer in module._buffers.items():
+                if buffer is not None and buffer.is_meta:
+                    module._buffers[name] = torch.zeros(buffer.shape, dtype=buffer.dtype)
+
     missing = [x for x in missing if x not in ignore_errors]
     unexpected = [x for x in unexpected if x not in ignore_errors]
 
-    if isinstance(ignore_start, str):
-        missing = [x for x in missing if not x.startswith(ignore_start)]
-        unexpected = [x for x in unexpected if not x.startswith(ignore_start)]
+    if ignore_start is not None:
+        missing = [x for x in missing if not x.startswith(tuple(ignore_start))]
+        unexpected = [x for x in unexpected if not x.startswith(tuple(ignore_start))]
+
+    unexpected = [x for x in unexpected if "comfy_attention" not in x]
 
     log_name = log_name or type(model).__name__
     if len(missing) > 0:
@@ -103,12 +122,36 @@ def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
 
 
 def detect_quantization(state_dict: dict[str, torch.Tensor], *, is_unet: bool = False) -> dict | None:
-    if any(k.endswith(".comfy_quant") for k in state_dict):
-        return {"mixed_ops": True, "TE": not is_unet}
+    count: dict[str, int] = {}
+
+    for key, val in state_dict.items():
+        if not key.endswith(".comfy_quant"):
+            continue
+
+        fmt: str = json.loads(val.numpy().tobytes())["format"]
+        count[fmt] = count.get(fmt, 0) + 1
+
+    if count:
+        from backend.quant_ops import QUANT_ALGOS
+
+        layout: str = QUANT_ALGOS[max(count, key=count.get)]["comfy_tensor_layout"]
+        return {"mixed_ops": True, "TE": not is_unet, "layout": layout}
+
     return None
 
 
-def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict) -> dict[str, torch.Tensor]:
+def _detect_prefix(sd: list[str], meta: str) -> str:
+    name = ""
+
+    for key in sd:
+        if key.endswith(f"{meta}.weight"):
+            name = key
+            break
+
+    return name.replace(f"{meta}.weight", "")
+
+
+def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict) -> tuple[dict[str, torch.Tensor], dict]:
     # https://github.com/Comfy-Org/ComfyUI/blob/v0.19.0/comfy/utils.py#L1358
     if metadata is None:
         metadata = {}
@@ -170,7 +213,8 @@ def convert_quantization(state_dict: dict[str, torch.Tensor], metadata: dict) ->
         quant_metadata = {"layers": layers}
 
     if layers := quant_metadata.get("layers", None):
+        prefix = _detect_prefix(state_dict.keys(), next(iter(layers.keys())))
         for k, v in layers.items():
-            state_dict["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
+            state_dict[f"{prefix}{k}.comfy_quant"] = torch.tensor(list(json.dumps(v).encode("utf-8")), dtype=torch.uint8)
 
     return state_dict, metadata

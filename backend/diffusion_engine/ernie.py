@@ -3,11 +3,10 @@ from huggingface_guess import model_list
 
 from backend import memory_management
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
-from backend.modules.k_prediction import PredictionDiscreteFlow
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
-from backend.text_processing.ministral3_engine import Ministral3TextProcessingEngine
+from backend.text_processing.ernie_engine import Ministral3Engine
 
 
 class ErnieImage(ForgeDiffusionEngine):
@@ -20,11 +19,11 @@ class ErnieImage(ForgeDiffusionEngine):
 
         vae = VAE(model=huggingface_components["vae"], is_flux2=True)
 
-        k_predictor = PredictionDiscreteFlow(estimated_config)
+        k_predictor = self._get_predictor()
 
         unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None, k_predictor=k_predictor, config=estimated_config)
 
-        self.text_processing_engine_ministral = Ministral3TextProcessingEngine(
+        self.text_processing_engine_ministral = Ministral3Engine(
             text_encoder=clip.cond_stage_model.ministral3,
             tokenizer=clip.tokenizer.ministral3,
         )
@@ -41,18 +40,6 @@ class ErnieImage(ForgeDiffusionEngine):
         return self.text_processing_engine_ministral(prompt)
 
     @torch.inference_mode()
-    def get_prompt_lengths_on_ui(self, prompt):
-        token_count = len(self.text_processing_engine_ministral.tokenize([prompt])[0])
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
+        token_count = len(self.text_processing_engine_ministral.tokenize(prompt))
         return token_count, max(999, token_count)
-
-    @torch.inference_mode()
-    def encode_first_stage(self, x):
-        sample = self.forge_objects.vae.encode(x.movedim(1, -1) * 0.5 + 0.5)
-        sample = self.forge_objects.vae.first_stage_model.process_in(sample)
-        return sample.to(x)
-
-    @torch.inference_mode()
-    def decode_first_stage(self, x):
-        sample = self.forge_objects.vae.first_stage_model.process_out(x)
-        sample = self.forge_objects.vae.decode(sample).movedim(-1, 1) * 2.0 - 1.0
-        return sample.to(x)

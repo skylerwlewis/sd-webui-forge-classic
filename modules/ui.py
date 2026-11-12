@@ -154,9 +154,11 @@ def update_token_counter(text, steps, styles, *, is_positive=True):
         assert get_prompt_lengths_on_ui is not None
     except Exception:
         return f"<span class='gr-box gr-text-input'>?/?</span>"
+    else:
+        from backend.text_processing.parsing import strip_emphasis
 
     flat_prompts = reduce(lambda list1, list2: list1 + list2, prompt_schedules)
-    prompts = [prompt_parser.strip_emphasis(prompt_text) for _, prompt_text in flat_prompts]
+    prompts = [strip_emphasis(prompt_text) for _, prompt_text in flat_prompts]
     token_count, max_length = max([get_prompt_lengths_on_ui(prompt) for prompt in prompts], key=lambda args: args[0])
     return f"<span class='gr-box gr-text-input'>{token_count}/{max_length}</span>"
 
@@ -195,6 +197,8 @@ def create_ui():
     reload_javascript()
 
     parameters_copypaste.reset()
+    main_entry.refresh_models()
+    main_entry.capture_callbacks()
 
     settings = ui_settings.UiSettings()
     settings.register_settings()
@@ -226,8 +230,8 @@ def create_ui():
                     elif category == "dimensions":
                         with FormRow():
                             with gr.Column(elem_id="txt2img_column_size", scale=4):
-                                width = gr.Slider(minimum=64, maximum=2048, step=_STEP, label="Width", value=1024, elem_id="txt2img_width")
-                                height = gr.Slider(minimum=64, maximum=2048, step=_STEP, label="Height", value=1024, elem_id="txt2img_height")
+                                width = gr.Slider(minimum=64, maximum=4096, step=_STEP, label="Width", value=1024, elem_id="txt2img_width")
+                                height = gr.Slider(minimum=64, maximum=4096, step=_STEP, label="Height", value=1024, elem_id="txt2img_height")
 
                             with gr.Column(elem_id="txt2img_dimensions_row", scale=1, elem_classes="dimensions-tools"):
                                 res_switch_btn = ToolButton(value=switch_values_symbol, elem_id="txt2img_res_switch_btn", tooltip="Switch width/height")
@@ -264,29 +268,24 @@ def create_ui():
                                     hr_distilled_cfg = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Hires Distilled CFG Scale", value=3.0, elem_id="txt2img_hr_distilled_cfg")
                                     hr_cfg = gr.Slider(minimum=1.0, maximum=24.0, step=0.5, label="Hires CFG Scale", value=6.0, elem_id="txt2img_hr_cfg")
 
-                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=shared.opts.hires_fix_show_sampler) as hr_checkpoint_container:
-                                    hr_checkpoint_name = gr.Dropdown(label="Hires Checkpoint", elem_id="hr_checkpoint", choices=["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True), value="Use same checkpoint", scale=2)
+                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=shared.opts.hires_fix_show_sampler):
 
-                                    hr_checkpoint_refresh = ToolButton(value=refresh_symbol)
+                                    def _load_models():
+                                        checkpoints = shared.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
+                                        modules = main_entry.module_list.keys() if shared.opts.sd_modules_dropdown_use_short else main_entry.module_map.values()
+                                        return [["Use same checkpoint"] + checkpoints, ["Use same choices"] + list(modules)]
 
-                                    def get_additional_modules():
-                                        modules_list = ["Use same choices"]
-                                        if main_entry.module_list == {}:
-                                            _, modules = main_entry.refresh_models()
-                                            modules_list += list(modules)
-                                        else:
-                                            modules_list += list(main_entry.module_list.keys())
-                                        return modules_list
+                                    checkpoints_list, modules_list = _load_models()
 
-                                    modules_list = get_additional_modules()
-
-                                    def refresh_model_and_modules():
-                                        modules_list = get_additional_modules()
-                                        return gr.update(choices=["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)), gr.update(choices=modules_list)
+                                    hr_checkpoint_name = gr.Dropdown(label="Hires Checkpoint", elem_id="hr_checkpoint", choices=checkpoints_list, value="Use same checkpoint", scale=2)
 
                                     hr_additional_modules = gr.Dropdown(label="Hires VAE / Text Encoder", elem_id="hr_vae_te", choices=modules_list, value=["Use same choices"], multiselect=True, scale=3)
 
-                                    hr_checkpoint_refresh.click(fn=refresh_model_and_modules, outputs=[hr_checkpoint_name, hr_additional_modules], show_progress=False)
+                                    def _refresh_models():
+                                        checkpoints_list, modules_list = _load_models()
+                                        return [gr.update(choices=checkpoints_list), gr.update(choices=modules_list)]
+
+                                    main_entry.on_refresh_checkpoint(_refresh_models, outputs=[hr_checkpoint_name, hr_additional_modules])
 
                                 with FormRow(elem_id="txt2img_hires_fix_row3b", variant="compact", visible=shared.opts.hires_fix_show_sampler) as hr_sampler_container:
                                     hr_sampler_name = gr.Dropdown(label="Hires sampling method", elem_id="hr_sampler", choices=["Use same sampler"] + sd_samplers.visible_sampler_names(), value="Use same sampler")
@@ -578,7 +577,7 @@ def create_ui():
                             )
 
                         with FormRow():
-                            resize_mode = gr.Radio(label="Resize mode", elem_id="resize_mode", choices=["Just resize", "Crop and resize", "Resize and fill", "Just resize (latent upscale)"], type="index", value="Crop and resize")
+                            resize_mode = gr.Radio(label="Resize Mode", elem_id="resize_mode", choices=["Just Resize", "Crop and Resize", "Resize and Fill", "Latent Upscale", "Preserve Aspect Ratio"], type="index", value="Crop and Resize")
 
                     elif category == "dimensions":
                         with FormRow():

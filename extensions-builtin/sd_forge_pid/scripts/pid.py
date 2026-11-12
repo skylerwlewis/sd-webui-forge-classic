@@ -28,7 +28,7 @@ class PiDForForge(scripts.Script):
     results: list[tuple[Image.Image], str] = []
 
     def __init__(self):
-        self.models: list[str] = [m for m in sorted(checkpoint_tiles(use_short=True)) if "pid" in m.lower()]
+        self.models: list[str] = [m for m in checkpoint_tiles(use_short=True) if "pid" in m.lower()]
 
     def title(self):
         return "PiD Integrated"
@@ -37,8 +37,8 @@ class PiDForForge(scripts.Script):
         return scripts.AlwaysVisible if bool(self.models) else None
 
     def ui(self, *args, **kwargs):
-        vaes: list[str] = sorted(vae_dict.keys())
-        modules: list[str] = [m for m in sorted(module_list.keys()) if m not in vaes]
+        vaes: list[str] = list(vae_dict.keys())
+        modules: list[str] = [m for m in module_list.keys() if m not in vaes]
 
         with InputAccordion(False, label=self.title()) as enable:
             prompt = gr.Textbox(value=None, lines=3, max_lines=3, label="Prompt", placeholder="(leave empty to use main prompt)")
@@ -156,6 +156,7 @@ class PiDForForge(scripts.Script):
             n_iter=1,
             steps=4,
             cfg_scale=1.0,
+            distilled_cfg_scale=1.5,
             width=p.width * 4,
             height=p.height * 4,
             restore_faces=False,

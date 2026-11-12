@@ -2,16 +2,18 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import torch
-
     from backend.patcher.clip import CLIP
     from backend.patcher.unet import UnetPatcher
     from backend.patcher.vae import VAE
     from modules_forge.packages.huggingface_guess.model_list import BASE
 
+import torch
 from safetensors.torch import save_file
 
 from backend import memory_management, utils
+from backend.args import dynamic_args
+from backend.misc.image_resize import resize_reference
+from backend.modules.k_prediction import PredictionDiscreteFlow, PredictionFlux
 
 
 class ForgeObjects:
@@ -40,10 +42,21 @@ class ForgeDiffusionEngine:
 
         self.current_lora_hash = str([])
 
-        self.fix_for_webui_backward_compatibility()
+        self.tiling_enabled = False
+        self.use_distilled_cfg_scale = False
+        self.use_shift = False
+        self.is_sd1 = False
+        self.is_sdxl = False
+        self.is_wan = False  # affects the usage of WanVAE (B, C, T, H, W)
 
         self.ini_latent: "torch.Tensor" = None  # image from img2img input
         self.ref_latents: list["torch.Tensor"] = []  # images from ImageStitch
+
+    def _get_predictor(self) -> PredictionDiscreteFlow | PredictionFlux:
+        if self.model_config.model_type.name == "FLOW":
+            return PredictionDiscreteFlow(self.model_config)
+        else:
+            return PredictionFlux(self.model_config)
 
     def set_clip_skip(self, clip_skip):
         pass
@@ -56,26 +69,47 @@ class ForgeDiffusionEngine:
         raise NotImplementedError
 
     @abstractmethod
-    def encode_first_stage(self, x):
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
         raise NotImplementedError
 
-    @abstractmethod
-    def decode_first_stage(self, x):
-        raise NotImplementedError
+    @torch.inference_mode()
+    def encode_first_stage(self, x: torch.Tensor, *, multiple: int = -1):
+        if multiple < 1:
+            return self._encode_first_stage(x)
 
-    def get_prompt_lengths_on_ui(self, prompt):
-        return 0, 75
+        reference = resize_reference(x[:1], multiple)
+        if dynamic_args.is_referencing:
+            self.store_reference(self._encode_first_stage(reference).cpu())
+            return
+
+        samples = self._encode_first_stage(x)
+        latent = samples[:1].clone() if reference.shape[-2:] == x.shape[-2:] else self._encode_first_stage(reference)
+        self.store_reference(latent.cpu())
+        return samples
+
+    def _encode_first_stage(self, x: torch.Tensor):
+        if self.is_wan:  # otherwise image batch turns into video...
+            samples: list[torch.Tensor] = []
+            for i in range(x.size(0)):
+                start_image = x[i : i + 1].movedim(1, -1).mul(0.5).add(0.5)
+                sample = self.forge_objects.vae.encode(start_image)
+                sample = self.forge_objects.vae.first_stage_model.process_in(sample)
+                samples.append(sample)
+            return torch.cat(samples, dim=0).to(x)
+        else:
+            start_image = x.movedim(1, -1).mul(0.5).add(0.5)
+            sample = self.forge_objects.vae.encode(start_image)
+            sample = self.forge_objects.vae.first_stage_model.process_in(sample)
+            return sample.to(x)
+
+    @torch.inference_mode()
+    def decode_first_stage(self, x: torch.Tensor):
+        sample = self.forge_objects.vae.first_stage_model.process_out(x)
+        sample = self.forge_objects.vae.decode(sample).movedim(-1, (2 if self.is_wan else 1)).mul_(2.0).sub_(1.0)
+        return sample.to(x)
 
     def is_webui_legacy_model(self):
         return self.is_sd1 or self.is_sdxl
-
-    def fix_for_webui_backward_compatibility(self):
-        self.tiling_enabled = False
-        self.use_distilled_cfg_scale = False
-        self.use_shift = False
-        self.is_sd1 = False
-        self.is_sdxl = False
-        self.is_wan = False  # affects the usage of WanVAE (B, C, T, H, W)
 
     @property
     def first_stage_model(self):
@@ -96,7 +130,13 @@ class ForgeDiffusionEngine:
         self.ref_latents.clear()
         memory_management.soft_empty_cache()
 
-    def set_shift(self, shift: float):
+    def store_reference(self, reference: torch.Tensor):
+        if dynamic_args.is_referencing:
+            self.ref_latents.append(reference)
+        else:
+            self.ini_latent = reference
+
+    def set_shift(self, shift: float, *args, **kwargs):
         if not self.use_shift:
             return
         self.forge_objects.unet.model.predictor.set_parameters(shift=shift)

@@ -3,26 +3,6 @@
 import argparse
 import enum
 
-
-class EnumAction(argparse.Action):
-    """Argparse `action` for handling Enum"""
-
-    def __init__(self, **kwargs):
-        enum_type = kwargs.pop("type", None)
-        assert issubclass(enum_type, enum.Enum)
-
-        choices = tuple(e.value for e in enum_type)
-        kwargs.setdefault("choices", choices)
-        kwargs.setdefault("metavar", f"[{','.join(choices)}]")
-
-        super(EnumAction, self).__init__(**kwargs)
-        self._enum = enum_type
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        value = self._enum(values)
-        setattr(namespace, self.dest, value)
-
-
 parser = argparse.ArgumentParser(add_help=False)
 
 parser.add_argument("--loglevel", type=str, default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level")
@@ -45,9 +25,9 @@ fpunet_group.add_argument("--fp8_e5m2-unet", action="store_true", help="Store th
 fpunet_group.add_argument("--fp8_e8m0fnu-unet", action="store_true", help="Store the diffusion model in fp8_e8m0fnu")
 
 fpvae_group = parser.add_mutually_exclusive_group()
-fpvae_group.add_argument("--fp32-vae", action="store_true", help="Run the VAE in full precision fp32")
-fpvae_group.add_argument("--bf16-vae", action="store_true", help="Run the VAE in bf16")
-fpvae_group.add_argument("--fp16-vae", action="store_true", help="Run the VAE in fp16 (might cause black images)")
+fpvae_group.add_argument("--fp32-vae", action="store_true", help="Store the VAE in full precision fp32")
+fpvae_group.add_argument("--bf16-vae", action="store_true", help="Store the VAE in bf16")
+fpvae_group.add_argument("--fp16-vae", action="store_true", help="Store the VAE in fp16 (might cause black images)")
 
 parser.add_argument("--cpu-vae", action="store_true", help="Run the VAE on the CPU")
 
@@ -60,28 +40,27 @@ fpte_group.add_argument("--fp8_e5m2-text-enc", action="store_true", help="Store 
 
 parser.add_argument("--cpu-text-enc", action="store_true", help="Run the text encoder on the CPU")
 
+parser.add_argument("--use-ck-attention", action="store_true", help="use Comfy-Kitchen attention")
 parser.add_argument("--use-pytorch-cross-attention", action="store_true", help="Use the PyTorch cross attention (override sageattention/flash_attn/xformers)")
-parser.add_argument("--force-xformers-vae", action="store_true", help="Force VAE to use xformers attention (meant to use with PyTorch cross attention)")
+parser.add_argument("--force-xformers-vae", action="store_true", help="Force VAE to use xformers attention (meant to be used with --use-pytorch-cross-attention)")
 parser.add_argument("--force-upcast-attention", action="store_true", help="Always upcast to fp32 during attention")
+parser.add_argument("--force-w4a8", action="store_true", help="Always use w4a8 when loading convrot_w4a4 models")
 
 parser.add_argument("--sage", action="store_true", help="install sageattention")
 parser.add_argument("--flash", action="store_true", help="install flash_attn")
 parser.add_argument("--xformers", action="store_true", help="install xformers")
 parser.add_argument("--nunchaku", action="store_true", help="install nunchaku for SVDQ inference")
-parser.add_argument("--bnb", action="store_true", help="install bitsandbytes for 4-bit inference")
-parser.add_argument("--onnxruntime-gpu", action="store_true", help="install nightly onnxruntime-gpu with cu130 support")
+parser.add_argument("--pynvml", action="store_true", help="install pyNVML for accurate VRAM tracking")
 
 parser.add_argument("--disable-sage", action="store_true", help="disable sageattention")
 parser.add_argument("--disable-flash", action="store_true", help="disable flash_attn")
 parser.add_argument("--disable-xformers", action="store_true", help="disable xformers")
 
-parser.add_argument("--directml", type=int, nargs="?", metavar="DIRECTML_DEVICE", const=-1, help="Use torch-directml")
 parser.add_argument("--deterministic", action="store_true", help="Use slower deterministic algorithms when possible")
 
 vram_group = parser.add_mutually_exclusive_group()
 vram_group.add_argument("--gpu-only", action="store_true", help="Store and run everything on the GPU")
 vram_group.add_argument("--highvram", action="store_true", help="Keeps models in VRAM after usage")
-vram_group.add_argument("--normalvram", action="store_true", help="Force NORMAL_VRAM in case LOW_VRAM gets automatically enabled")
 vram_group.add_argument("--lowvram", action="store_true", help="Split the diffusion model in parts to use less VRAM")
 vram_group.add_argument("--novram", action="store_true", help="When even LOW_VRAM is still not enough")
 vram_group.add_argument("--cpu", action="store_true", help="Use the CPU for everything (slow)")
@@ -116,7 +95,7 @@ class SageAttentionFuncs(enum.Enum):
 
 
 sage = parser.add_argument_group(description="SageAttention")
-sage.add_argument("--sage-function", type=SageAttentionFuncs, default=SageAttentionFuncs.auto, action=EnumAction)
+sage.add_argument("--sage-function", type=SageAttentionFuncs, default=SageAttentionFuncs.auto)
 
 
 args, _ = parser.parse_known_args()
@@ -158,6 +137,8 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
     """Flux Kontext"""
     edit: bool = False
     """Qwen-Image-Edit"""
+    qwen21: bool = False
+    """Qwen-Image-2.1"""
     nunchaku: bool = False
     """Nunchaku (SVDQ) Models"""
     klein: bool = False
@@ -166,14 +147,26 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
     """Wan 2.2"""
     pid: bool = False
     """PiD"""
+    anima: bool = False
+    """Anima"""
+    krea2: bool = False
+    """Krea 2"""
+    moss: bool = False
+    """Moss-Image"""
     ref_latents: list["torch.Tensor"] = []
-    """Reference Latent(s) for Flux Kontext / Qwen-Image-Edit / Flux.2 Klein"""
+    """Reference Latent(s) for Edit Models"""
+    moss_reference_method: str = None
+    """reference_latents_method for Moss-Image"""
+    moss_ref_kv: "torch.Tensor" = None
+    """Cached per-block reference K/V for Moss-Image isolated reference methods"""
     concat_latent: "torch.Tensor" = None
     """Input Latent for Wan 2.2 I2V"""
     lq_latent: list["torch.Tensor", "torch.Tensor"] = [None, None]
     """lq_latent & degrade_sigma for PiD"""
     context_handler: "IndexListContextHandler" = None
     """Context Handler for PiD"""
+    image_slots: list[int] = None
+    """Image Slots for Qwen-Image-2.1"""
     is_referencing: bool = False
     """Appending Reference Latent(s) (by. ImageStitch)"""
     ops: str = None
@@ -189,6 +182,13 @@ class dynamic_args(metaclass=_DynamicArgsMeta):
             return
 
         cls.ref_latents.clear()
+        cls.moss_reference_method = None
+        cls.moss_ref_kv = None
         cls.concat_latent = None
         cls.lq_latent = [None, None]
         cls.context_handler = None
+        cls.image_slots = None
+
+    @classmethod
+    def can_reference(cls) -> bool:
+        return any(getattr(cls, key) for key in ("kontext", "edit", "qwen21", "klein", "wan", "anima", "krea2", "moss"))

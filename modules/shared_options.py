@@ -63,6 +63,7 @@ options_templates.update(
             "save_mask_composite": OptionInfo(False, "For inpainting, save the masked composite"),
             "jpeg_quality": OptionInfo(85, "JPEG Quality", gr.Slider, {"minimum": 1, "maximum": 100, "step": 1}),
             "webp_lossless": OptionInfo(False, "Lossless WebP"),
+            "alpha_threshold": OptionInfo(16, "Alpha Threshold", gr.Slider, {"minimum": 0, "maximum": 255, "step": 1}).info("alpha below this value is considered fully transparent"),
             "export_for_4chan": OptionInfo(True, "Save copies of large images as JPG").info("if the following limits are met"),
             "img_downscale_threshold": OptionInfo(4.0, "File Size limit for the above option", gr.Number).info("in MB"),
             "target_side_length": OptionInfo(4096, "Width/Height limit for the above option", gr.Number).info("in pixels"),
@@ -102,13 +103,14 @@ options_templates.update(
     options_section(
         ("saving-paths", "Paths for Saving", "saving"),
         {
-            "outdir_samples": OptionInfo("", "Output Directory", component_args=hide_dirs).info("if empty, default to the <b>four</b> folders below"),
+            "outdir_samples": OptionInfo("", "Output Directory", component_args=hide_dirs).info("override the following <b>five</b> settings below"),
             "outdir_txt2img_samples": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "txt2img-images")), "Output Directory for txt2img Images", component_args=hide_dirs),
+            "outdir_hires_samples": OptionInfo("", "Output Directory for Hires. fix Images", component_args=hide_dirs).info("if empty, save in the txt2img folder above"),
             "outdir_img2img_samples": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "img2img-images")), "Output Directory for img2img Images", component_args=hide_dirs),
             "outdir_extras_samples": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "extras-images")), "Output Directory for Extras Images", component_args=hide_dirs),
             "outdir_videos": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "videos")), "Output Directory for Videos", component_args=hide_dirs),
             "div00": OptionDiv(),
-            "outdir_grids": OptionInfo("", "Output Directory for Grids", component_args=hide_dirs).info("if empty, default to the <b>two</b> folders below"),
+            "outdir_grids": OptionInfo("", "Output Directory for Grids", component_args=hide_dirs).info("override the following <b>two</b> settings below"),
             "outdir_txt2img_grids": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "txt2img-grids")), "Output Directory for txt2img Grids", component_args=hide_dirs),
             "outdir_img2img_grids": OptionInfo(util.truncate_path(os.path.join(default_output_dir, "img2img-grids")), "Output Directory for img2img Grids", component_args=hide_dirs),
             "div01": OptionDiv(),
@@ -176,6 +178,7 @@ options_templates.update(
             "dump_stacks_on_signal": OptionInfo(False, "Print the stack trace before terminating the webui via Ctrl + C"),
             "confirm_leave": OptionInfo(False, "Show a browser confirmation before leaving the page"),
             "no_spellcheck": OptionInfo(False, "Disable auto-correct / spellcheck for prompt fields").needs_reload_ui(),
+            "keep_alive": OptionInfo(False, "Keep generating even when the WebUI browser tab is not in focus").info('for "Generate forever"').needs_reload_ui(),
             "undo_redo": OptionInfo(False, "Enable undo / redo history for prompt fields").needs_reload_ui(),
         },
     )
@@ -235,6 +238,13 @@ options_templates.update(
             "sdxl_refiner_high_aesthetic_score": OptionInfo(6.0, "[SDXL] High Aesthetic Score", gr.Number),
             "sdxl_10": OptionRow(),
             "sdxl_zero_neg": OptionInfo(False, "[SDXL] Zero out the conditioning when negative prompt is empty").info("old behavior ; causes NaN when using SageAttention").needs_reload_ui(),
+            "divslg": OptionDiv(),
+            "slg_enable": OptionInfo(True, "[Moss-Image] Enable Skip Layer Guidance", infotext="Skip Layer Guidance").info("the official document recommends skipping uncond for layer 22, optionally 24 and 26"),
+            "slg_single_layers": OptionInfo("22", "Layers to Skip", gr.Textbox, {"lines": 1, "max_lines": 1, "placeholder": "22, 24, 26"}, infotext="SLG Single Layers").info("comma-separated block indices"),
+            "slg_1": OptionRow(),
+            "slg_start_percent": OptionInfo(0.0, "Start Percent", gr.Number, infotext="SLG Start Percent"),
+            "slg_end_percent": OptionInfo(0.5, "End Percent", gr.Number, infotext="SLG End Percent"),
+            "slg_0": OptionRow(),
             "divlumina": OptionDiv(),
             "neta_template_positive": OptionInfo(
                 "You are an assistant designed to generate anime images with the highest degree of image-text alignment based on danbooru tags. <Prompt Start>",
@@ -249,8 +259,13 @@ options_templates.update(
                 {"lines": 3, "max_lines": 6, "placeholder": "<Prompt Start>"},
             ),
             "divmisc": OptionDiv(),
-            "qwen_vae_resize": OptionInfo(False, "[Qwen-Image-Edit] Resize input image to 1 megapixel for ref_latent"),
-            "klein_no_reference": OptionInfo(False, "[Klein] Disable Reference").info("disable Edit ; enable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
+            "reference_max_side": OptionInfo(1024, "Maximum Side Length for Reference Images", gr.Slider, {"minimum": 0, "maximum": 2048, "step": 256}).info("applies to reference images from img2img and ImageStitch").info("set to 0 for no limit"),
+            "klein_do_reference": OptionInfo(True, "[Klein] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
+            "qwen21_do_reference": OptionInfo(True, "[Qwen 2.1] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often"),
+            "anima_do_reference": OptionInfo(False, "[Anima] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often").info("requires specfic Edit LoRA"),
+            "krea2_do_reference": OptionInfo(False, "[Krea2] Enable Reference").info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often").info("requires specfic Edit LoRA"),
+            "moss_do_reference": OptionInfo("Disable", "[Moss-Image] Reference Method", gr.Dropdown, {"choices": ("Disable", "ai-toolkit", "Moss-Image-Edit")}).info("enable Edit ; disable img2img").info("pin to <b>Quicksettings</b> is recommended if changed often").info("requires specfic Edit LoRA"),
+            "reference_explanation": OptionHTML("<b>Note:</b> Remember to change the setting before txt2img to clear the references"),
         },
     )
 )
@@ -316,6 +331,7 @@ options_templates.update(
         ("optimizations", "Optimizations", "sd"),
         {
             "cross_attention_optimization": OptionInfo("Automatic", "Cross Attention Optimization", gr.Dropdown, {"choices": ("Automatic",), "interactive": False}),
+            "batch_cond_uncond": OptionInfo(True, "Batch Cond/Uncond").info("do both positive and negative denoising in the same batch ; increase speed & VRAM usage").info("less effective on macOS"),
             "persistent_cond_cache": OptionInfo(True, "Persistent Cond Cache").info("do not re-encode prompts if only the Seed changes ; <b>Note:</b> may cause certain Infotext to be missing"),
             "skip_early_cond": OptionInfo(0.0, "Ignore Negative Prompt during Early Steps", gr.Slider, {"minimum": 0.0, "maximum": 1.0, "step": 0.05}, infotext="Skip Early CFG").info("in percentage of total steps; 0 = disable; higher = faster"),
             "s_min_uncond": OptionInfo(0.0, "Skip Negative Prompt during Later Steps", gr.Slider, {"minimum": 0.0, "maximum": 8.0, "step": 0.05}).info('in "sigma"; 0 = disable; higher = faster'),
@@ -367,19 +383,9 @@ options_templates.update(
     options_section(
         ("refiner", "Refiner", "sd"),
         {
-            "show_refiner": OptionInfo(False, "Display the Refiner Accordion").info("Refiner swaps the model in the middle of generation; useful for Wan 2.2 <b>High Noise</b> to <b>Low Noise</b> switching").needs_reload_ui(),
-            "refiner_fast_sd": OptionInfo(False, 'Reload "state_dict" Only').info("EXPERIMENTAL"),
+            "show_refiner": OptionInfo(True, "Display the Refiner Accordion").info("Refiner swaps the model in the middle of generation; useful for Wan 2.2 <b>High Noise</b> to <b>Low Noise</b> switching").needs_reload_ui(),
+            "refiner_fast_sd": OptionInfo(False, 'Reload "state_dict" Only').info("EXPERIMENTAL").needs_reload_ui(),
             "refiner_use_steps": OptionInfo(False, 'Switch based on "steps" instead').info('by default, Refiner swaps the model based on "sigmas" to match <a href="https://www.reddit.com/r/StableDiffusion/comments/1n3qns1/wan_22_how_many_highsteps_are_needed_a_simple/">Wan 2.2</a> \'s behavior'),
-            "refiner_lora_replacement": OptionInfo(
-                "high_noise=low_noise",
-                "Lora Replacements",
-                gr.Textbox,
-                {"lines": 3, "max_lines": 12, "placeholder": "high_noise=low_noise"},
-            ),
-            "refiner_lora_explanation": OptionHTML("""
-Use the "Lora Replacements" to load different LoRAs between the normal pass and the refiner pass.<br>
-Separate the original and the target with an equal sign; Place each entry in its own line.
-                """),
         },
     )
 )
@@ -393,6 +399,7 @@ options_templates.update(
             "keyedit_delimiters": OptionInfo(r".,\/!?%^*;:{}=`~() ", "RegEx Delimiters when editing the prompt with Ctrl + Up/Down"),
             "keyedit_delimiters_whitespace": OptionInfo(["Tab", "Carriage Return", "Line Feed"], "Whitespace Delimiters when editing the prompt with Ctrl + Up/Down", gr.CheckboxGroup, {"choices": ("Tab", "Carriage Return", "Line Feed")}),
             "keyedit_move": OptionInfo(True, "Alt + Left/Right moves prompt chunks"),
+            "prompt_debounce": OptionInfo(0, "Delay before a prompt edit is sent to Gradio", gr.Slider, {"minimum": 0, "maximum": 500, "step": 50}).info("in ms ; reduce lag when typing prompts, may also affect Extensions that react to the prompt inputs").needs_reload_ui(),
             "disable_token_counters": OptionInfo(False, "Disable Token Counter"),
             "include_styles_into_token_counters": OptionInfo(True, "Include enabled Styles in Token Count"),
         },
@@ -429,6 +436,7 @@ options_templates.update(
             "quicksettings_accordion_starts_closed": OptionInfo(False, "Close the Accordion on startup").info("for the above option").needs_reload_ui(),
             "remove_image_on_hover": OptionInfo(True, "For image inputs in Extras and PNG Info, remove the current image when dragging another image over it").info("allow you to drag-and-drop images onto the input similar to AUTOMATIC1111 behavior").needs_reload_ui(),
             "forbidden_knowledge": OptionInfo(False, "Forbidden Knowledge").info('replace "<b>DPM++ 2s a RF</b>" with "<b>Flux Realistic</b>"').needs_restart(),
+            "xyz_use_cost": OptionInfo(True, "Enable the cost system for X/Y/Z Plot").info("swap expensive axis (e.g. Checkpoint) the least number of times ; may generate images out of the order specified in the UI").needs_restart(),
             "div_prompt": OptionDiv(),
             "prompt_box_style": OptionInfo("Default", "Prompt Layout", gr.Radio, {"choices": ("Default", "Compact", "Scrollable", "Accordion")}).html(f"""
 <ul style='margin-left: 1.5em'>
@@ -440,7 +448,8 @@ options_templates.update(
                 """).needs_reload_ui(),
             "div_classic": OptionDiv(),
             "dimensions_and_batch_together": OptionInfo(True, "Show Width/Height and Batch sliders in same row").needs_reload_ui(),
-            "sd_checkpoint_dropdown_use_short": OptionInfo(False, "Show filenames without folder in the Checkpoint dropdown").info("if disabled, models under subdirectories will be listed like sdxl/anime.safetensors"),
+            "sd_checkpoint_dropdown_use_short": OptionInfo(False, "Show filenames without folder in the Checkpoint dropdown").info("if disabled, models under subdirectories will be listed like sdxl/anime.safetensors").needs_reload_ui(),
+            "sd_modules_dropdown_use_short": OptionInfo(True, "Show filenames without folder in the VAE / Text Encoder dropdown").info("if disabled, modules under subdirectories will be listed like sdxl/clip-l-anime.safetensors").needs_reload_ui(),
             "hires_fix_show_sampler": OptionInfo(False, "[Hires. fix]: Show checkpoint, sampler, scheduler, and cfg options").needs_reload_ui(),
             "hires_fix_show_prompts": OptionInfo(False, "[Hires. fix]: Show prompt and negative prompt textboxes").needs_reload_ui(),
             "txt2img_settings_accordion": OptionInfo(False, "Put txt2img parameters under Accordion").needs_reload_ui(),
@@ -485,6 +494,7 @@ options_templates.update(
             "add_version_to_infotext": OptionInfo(True, "Add webui version to infotext"),
             "disable_weights_auto_swap": OptionInfo(True, "Ignore the Checkpoint when reading infotext"),
             "disable_modules_auto_swap": OptionInfo(True, "Ignore the VAE / Text Encoder when reading infotext"),
+            "strip_whitespaces": OptionInfo(True, "Remove leading and trailing whitespaces from the prompts"),
             "infotext_skip_pasting": OptionInfo([], "Ignore fields when reading infotext", ui_components.DropdownMulti, lambda: {"choices": shared_items.get_infotext_names()}),
             "infotext_styles": OptionInfo("Apply if any", "Infer Styles when reading infotext", gr.Radio, {"choices": ("Ignore", "Apply", "Apply if any", "Discard")}).html("""
 <ul style='margin-left: 1.5em'>

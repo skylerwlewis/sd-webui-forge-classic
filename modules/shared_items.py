@@ -14,7 +14,7 @@ def postprocessing_scripts():
 def sd_vae_items():
     import modules.sd_vae
 
-    return ["Automatic", "None", *list(modules.sd_vae.vae_dict)]
+    return ["Automatic", "None", *modules.sd_vae.vae_dict]
 
 
 def refresh_vae_list():
@@ -172,6 +172,12 @@ class Shared(sys.modules[__name__].__class__):
         import modules.sd_models
 
         modules.sd_models.model_data.set_sd_model(value)
+
+    @property
+    def batch_cond_uncond(self):
+        from modules import shared
+
+        return shared.opts.batch_cond_uncond
 
 
 sys.modules["modules.shared"].__class__ = Shared

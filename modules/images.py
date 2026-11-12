@@ -260,10 +260,11 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=
 
     Args:
         resize_mode: The mode to use when resizing the image.
-            0: Resize the image to the specified width and height.
-            1: Resize the image to fill the specified width and height, maintaining the aspect ratio, and then center the image within the dimensions, cropping the excess.
-            2: Resize the image to fit within the specified width and height, maintaining the aspect ratio, and then center the image within the dimensions, filling empty with data from image.
-        im: The image to resize.
+            0: Just Resize
+            1: Crop and Resize
+            2: Resize and Fill
+            3: Latent Upscale
+            4: Preserve Aspect Ratio
         width: The width to resize the image to.
         height: The height to resize the image to.
         upscaler_name: The name of the upscaler to use. If not provided, defaults to opts.upscaler_for_img2img.
@@ -309,7 +310,7 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=
         res = Image.new("RGB" if not force_RGBA else "RGBA", (width, height))
         res.paste(resized, box=(width // 2 - src_w // 2, height // 2 - src_h // 2))
 
-    else:
+    elif resize_mode == 2:
         ratio = width / height
         src_ratio = im.width / im.height
 
@@ -330,6 +331,17 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None, force_RGBA=
             if fill_width > 0:
                 res.paste(resized.resize((fill_width, height), box=(0, 0, 0, height)), box=(0, 0))
                 res.paste(resized.resize((fill_width, height), box=(resized.width, 0, resized.width, height)), box=(fill_width + src_w, 0))
+
+    elif resize_mode == 3:
+        raise ValueError
+
+    elif resize_mode == 4:
+        from modules.ui import sRound
+
+        ratio = min(width / im.width, height / im.height)
+        new_w = sRound(im.width * ratio)
+        new_h = sRound(im.height * ratio)
+        res = resize(im, new_w, new_h)
 
     return res
 
@@ -572,6 +584,25 @@ def get_next_sequence_number(path, basename):
     return result + 1
 
 
+def _process_alpha(image: Image.Image) -> Image.Image:
+    if image.mode != "RGBA":
+        return image
+
+    alpha = image.getchannel("A")
+    if alpha.getextrema() == (255, 255):
+        return image.convert("RGB")
+
+    if opts.alpha_threshold < 1:
+        return image
+
+    alpha = alpha.point(lambda a: 0 if a < opts.alpha_threshold else a)
+    rgb = image.convert("RGB")
+    zero_alpha = alpha.point(lambda a: 255 if a < 1 else 0)
+    rgb.paste("black", mask=zero_alpha)
+
+    return Image.merge("RGBA", (*rgb.split(), alpha))
+
+
 def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_pnginfo=None, pnginfo_section_name="parameters"):
     """
     Saves image to filename, including geninfo as text information for generation info.
@@ -583,6 +614,7 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
         extension = os.path.splitext(filename)[1]
 
     image_format = Image.registered_extensions()[extension]
+    image = _process_alpha(image)
 
     if extension.lower() == ".png":
         existing_pnginfo = existing_pnginfo or {}
@@ -597,10 +629,10 @@ def save_image_with_geninfo(image, geninfo, filename, extension=None, existing_p
         image.save(filename, format=image_format, quality=opts.jpeg_quality, pnginfo=pnginfo_data)
 
     elif extension.lower() in (".jpg", ".jpeg", ".webp"):
-        if image.mode == "RGBA":
+        if image.mode == "RGBA" and extension.lower() in (".jpg", ".jpeg"):
             image = image.convert("RGB")
         elif image.mode == "I;16":
-            image = image.point(lambda p: p * 0.0038910505836576).convert("RGB" if extension.lower() == ".webp" else "L")
+            image = image.point(lambda p: p * (255 / 65535)).convert("L")
 
         image.save(filename, format=image_format, quality=opts.jpeg_quality, lossless=opts.webp_lossless)
 
